@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Multi-vector blog search</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+    form { display: flex; gap: 0.5rem; }
+    input { flex: 1; min-width: 0; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #grid { overflow-x: auto; }
+    table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { border: 1px solid #8886; padding: 0.25rem 0.5rem; text-align: right; white-space: nowrap; }
+    #answer-progress { width: 100%; }
+  </style>
+</head>
+<body>
+  <form id="search">
+    <input id="query" type="search" placeholder="Search the blog" aria-label="Search the blog" required disabled>
+    <button disabled>Search</button>
+  </form>
+  <p id="status">Loading…</p>
+  <div id="grid"></div>
+  <details>
+    <summary>Raw results (JSON)</summary>
+    <pre id="results"></pre>
+  </details>
+  <section id="answer" hidden>
+    <p><button id="generate">Generate answer</button> <span id="answer-status"></span></p>
+    <progress id="answer-progress" hidden></progress>
+    <pre id="trace"></pre>
+  </section>
+
+  <script type="module">
+    import init, { ColBERT } from "https://cdn.jsdelivr.net/npm/pylate-rs@1.0.4/pylate_rs.js";
+    import { lookupTables, scorePassages, tokenScores, topPosts } from "./scorer.js";
+
+    // Order matches the ColBERT constructor arguments.
+    const MODEL_FILES = [
+      "model.safetensors",
+      "1_Dense/model.safetensors",
+      "tokenizer.json",
+      "config.json",
+      "config_sentence_transformers.json",
+      "1_Dense/config.json",
+      "special_tokens_map.json",
+    ];
+    const TOP_K = 10;
+    const GRID_ROWS = 5;
+    const SOURCES = 5; // top results given to the language model
+
+    const form = document.querySelector("#search");
+    const input = document.querySelector("#query");
+    const button = form.querySelector("button");
+    const status = document.querySelector("#status");
+    const grid = document.querySelector("#grid");
+    const output = document.querySelector("#results");
+    const answer = document.querySelector("#answer");
+    const generate = document.querySelector("#generate");
+    const answerStatus = document.querySelector("#answer-status");
+    const bar = document.querySelector("#answer-progress");
+    const trace = document.querySelector("#trace");
+
+    // The sections Pleias-RAG writes, in order; the bar advances as each one starts.
+    const SECTIONS = ["query_analysis", "query_report", "source_analysis", "source_report", "draft", "answer"];
+
+    // Show the bar filled to value/max, or animated (no value) when progress can't be measured.
+    function progress(value, max) {
+      bar.hidden = false;
+      if (value === undefined) {
+        bar.removeAttribute("value");
+      } else {
+        bar.max = max;
+        bar.value = value;
+      }
+    }
+    const say = (text) => (status.textContent = text);
+    const mb = (bytes) => (bytes / 1e6).toFixed(0);
+
+    // The language model runs in llm-worker.js, started on the first click. Its raw output,
+    // reasoning trace and all, streams into #trace.
+    let worker = null;
+    let request = 0; // id of the answer being written; output from older ones is ignored
+    let current = null; // { query, sources } from the latest search
+
+    function answerWorker() {
+      worker ??= new Worker("./llm-worker.js", { type: "module" });
+      worker.onmessage = ({ data }) => {
+        if (data.id !== request) return;
+        if (data.type === "loading") {
+          progress();
+          answerStatus.textContent = "Starting the language model…";
+        } else if (data.type === "progress") {
+          if (data.loaded < data.total) {
+            progress(data.loaded, data.total);
+            answerStatus.textContent = `Downloading the language model: ${mb(data.loaded)} of ${mb(data.total)} MB`;
+          } else {
+            progress();
+            answerStatus.textContent = "Starting the language model…";
+          }
+        } else if (data.type === "reading") {
+          progress();
+          answerStatus.textContent = `Reading ${data.sources} sources (${data.tokens.toLocaleString()} tokens)…`;
+        } else if (data.type === "text") {
+          trace.textContent += data.text;
+          const step = SECTIONS.findLastIndex((s) => trace.textContent.includes(`<|${s}_start|>`)) + 1;
+          progress(step, SECTIONS.length + 1); // the answer, the longest section, isn't done when it starts
+          const where = step ? `the ${SECTIONS[step - 1].replace("_", " ")} (step ${step} of ${SECTIONS.length})` : "";
+          const rate = data.rate ? ` at ${data.rate.toFixed(1)} tokens/s` : "";
+          answerStatus.textContent = `Writing ${where}: ${data.tokens} tokens${rate}`;
+        } else {
+          bar.hidden = true;
+          answerStatus.textContent = data.type === "done"
+            ? `Done: ${data.tokens} tokens in ${data.seconds.toFixed(0)} s.`
+            : `Could not write an answer: ${data.message}`;
+          generate.disabled = false;
+        }
+      };
+      return worker;
+    }
+
+    generate.addEventListener("click", () => {
+      request++;
+      trace.textContent = "";
+      generate.disabled = true;
+      progress();
+      answerStatus.textContent = "Starting the language model…";
+      answerWorker().postMessage({ type: "generate", id: request, ...current });
+    });
+
+    const YELLOW = [255, 209, 0]; // construction yellow, #FFD100
+
+    // Background for a value: white at its column's lowest, construction yellow at its highest.
+    function heat(value, min, max) {
+      const t = max > min ? (value - min) / (max - min) : 1;
+      const [r, g, b] = YELLOW.map((c) => Math.round(255 + t * (c - 255)));
+      return `rgb(${r} ${g} ${b})`;
+    }
+
+    // One row per result, one column per query token: that token's part of the result's score.
+    // `tokens` are the query's 32 tokens: [CLS], the query marker, the query's own tokens, [SEP],
+    // then [MASK] padding. Everything but the query's own tokens is summed into one column.
+    function renderGrid(tokens, rows) {
+      const sep = tokens.indexOf("[SEP]");
+      const own = tokens.slice(2, sep).map((token, k) => [token, k + 2]);
+      const other = tokens.map((_, i) => i).filter((i) => i < 2 || i >= sep);
+      const cell = (tag, text) => Object.assign(document.createElement(tag), { textContent: text });
+      const sum = (scores, indices) => indices.reduce((total, i) => total + scores[i], 0);
+
+      // Values as displayed (2 decimals), so cells that show the same number get the same color.
+      const columns = [
+        ...own.map(([, i]) => (scores) => scores[i]),
+        (scores) => sum(scores, other),
+        (scores) => scores.reduce((a, b) => a + b),
+      ];
+      const values = rows.map((scores) => columns.map((column) => Number(column(scores).toFixed(2))));
+      const ranges = columns.map((_, c) => {
+        const column = values.map((row) => row[c]);
+        return [Math.min(...column), Math.max(...column)];
+      });
+
+      const table = document.createElement("table");
+      const head = table.createTHead().insertRow();
+      for (const text of ["", ...own.map(([token]) => token), `Other ${other.length}`, "Total"]) {
+        head.append(cell("th", text));
+      }
+      const body = table.createTBody();
+      values.forEach((row, r) => {
+        const tr = body.insertRow();
+        tr.append(cell("th", `Rank ${r + 1}`));
+        row.forEach((value, c) => {
+          const td = cell("td", value.toFixed(2));
+          td.style.background = heat(value, ...ranges[c]);
+          td.style.color = "#000"; // readable on white and yellow, in dark mode too
+          tr.append(td);
+        });
+      });
+      const masks = tokens.filter((t) => t === "[MASK]").length;
+      const note =
+        `Each column is shaded from white (its lowest of the five) to yellow (its highest). ` +
+        `Other: ${tokens[0]}, ${tokens[1]} (query marker), [SEP], and ${masks} [MASK] tokens the model pads every query with.`;
+      grid.replaceChildren(table, cell("p", note));
+    }
+
+    async function get(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      return res;
+    }
+
+    async function download(url, onProgress) {
+      const res = await get(url);
+      const total = Number(res.headers.get("content-length")) || 0;
+      const reader = res.body.getReader();
+      const chunks = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        onProgress(received, total);
+      }
+      const bytes = new Uint8Array(received);
+      let at = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, at);
+        at += chunk.length;
+      }
+      return bytes;
+    }
+
+    // Model files are pinned to a revision, so a cached copy never goes stale.
+    async function modelFile(url, onProgress) {
+      let cache;
+      try {
+        cache = await caches.open("multivector-rag-demo");
+      } catch {
+        // No Cache API (for example some private windows): download every visit.
+      }
+      const hit = await cache?.match(url);
+      if (hit) return new Uint8Array(await hit.arrayBuffer());
+      const bytes = await download(url, onProgress);
+      await cache?.put(url, new Response(bytes)).catch(() => {}); // out of storage: just don't cache
+      return bytes;
+    }
+
+    try {
+      say("Loading the index…");
+      const [docs, bits] = await Promise.all([
+        get("data/docs.json").then((r) => r.json()),
+        get("data/index.bin").then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)),
+      ]);
+      const offsets = Int32Array.from(docs.offsets);
+      const passagePost = docs.passages.map((p) => p.post);
+
+      const { repo, revision } = docs.model;
+      const files = [];
+      for (const name of MODEL_FILES) {
+        const url = `https://huggingface.co/${repo}/resolve/${revision}/${name}`;
+        files.push(await modelFile(url, (got, total) =>
+          say(`Downloading the model (first visit only): ${name} ${mb(got)}${total ? ` of ${mb(total)}` : ""} MB`)));
+      }
+      say("Starting the model…");
+      await init();
+      const model = new ColBERT(...files, 32);
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const query = input.value.trim();
+        if (!query) return;
+        button.disabled = true;
+        say("Searching…");
+        // Let "Searching…" appear before the encoding and scoring block the page. A timer, not
+        // requestAnimationFrame, which never fires while the tab is hidden.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        try {
+          let start = performance.now();
+          const { embeddings } = model.encode({ sentences: [query] }, true);
+          const encodeMs = performance.now() - start;
+          start = performance.now();
+          const tables = lookupTables(Float32Array.from(embeddings[0].flat()), docs.dim);
+          const scores = scorePassages(tables, bits, offsets);
+          const scoreMs = performance.now() - start;
+
+          const top = topPosts(scores, passagePost, TOP_K);
+          // pylate-rs only exposes the query's tokens through raw_similarity_matrix.
+          const tokens = model.raw_similarity_matrix({ queries: [query], documents: ["."] }).query_tokens[0];
+          renderGrid(tokens, top.slice(0, GRID_ROWS).map((r) => tokenScores(tables, bits, offsets, r.passage)));
+
+          const results = top.map(({ post, passage, score }, i) => ({
+            rank: i + 1,
+            score: Number(score.toFixed(3)),
+            title: docs.posts[post].title,
+            section: docs.passages[passage].section,
+            date: docs.posts[post].date,
+            url: docs.passages[passage].url,
+            text: docs.passages[passage].text,
+          }));
+          output.textContent = JSON.stringify(
+            { query, timingMs: { encode: Math.round(encodeMs), score: Math.round(scoreMs) }, results },
+            null,
+            2,
+          );
+
+          // A new search replaces any answer still being written for the previous one.
+          request++;
+          worker?.postMessage({ type: "stop" });
+          current = { query, sources: top.slice(0, SOURCES).map((r) => docs.passages[r.passage].text) };
+          trace.textContent = "";
+          bar.hidden = true;
+          answerStatus.textContent = "Pleias-RAG-350M on your GPU (WebGPU). The first use downloads 448 MB.";
+          generate.disabled = false;
+          answer.hidden = false;
+          say(`Searched ${docs.passages.length.toLocaleString()} passages from ${docs.posts.length} posts.`);
+        } catch (error) {
+          say(`Search failed: ${error.message}`);
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      input.disabled = button.disabled = false;
+      input.focus();
+      say(`Ready: ${docs.passages.length.toLocaleString()} passages from ${docs.posts.length} posts.`);
+    } catch (error) {
+      say(`Could not load: ${error.message}`);
+      throw error;
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "multivector-rag-demo",
+  "private": true,
+  "type": "module",
+  "description": "Multi-vector (ColBERT) search that runs entirely in the browser",
+  "dependencies": {
+    "pylate-rs": "1.0.4"
+  }
+}
